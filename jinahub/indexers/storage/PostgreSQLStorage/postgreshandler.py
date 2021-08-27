@@ -1,14 +1,15 @@
 __copyright__ = "Copyright (c) 2021 Jina AI Limited. All rights reserved."
 __license__ = "Apache-2.0"
 
-from typing import Optional, Generator, Tuple
+import datetime
+from typing import Generator, List, Optional, Tuple
 
 import numpy as np
 import psycopg2
 import psycopg2.extras
-from jina import DocumentArray, Document
+from jina import Document, DocumentArray
 from jina.logging.logger import JinaLogger
-from psycopg2 import pool
+from psycopg2 import pool  # noqa: F401
 
 
 def doc_without_embedding(d: Document):
@@ -17,13 +18,14 @@ def doc_without_embedding(d: Document):
     return new_doc.SerializeToString()
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 SCHEMA_VERSIONS_TABLE_NAME = 'schema_versions'
 
 
 class PostgreSQLHandler:
     """
-    Postgres Handler to connect to the database and can apply add, update, delete and query.
+    Postgres Handler to connect to the database and
+     can apply add, update, delete and query.
 
     :param hostname: hostname of the machine
     :param port: the port
@@ -32,6 +34,8 @@ class PostgreSQLHandler:
     :param database: the database name
     :param collection: the collection name
     :param dry_run: If True, no database connection will be build
+    :param total_shards: the number of shards to
+    distribute the data (used when rolling update on Searcher side)
     :param args: other arguments
     :param kwargs: other keyword arguments
     """
@@ -47,6 +51,7 @@ class PostgreSQLHandler:
         max_connections: int = 5,
         dump_dtype: type = np.float64,
         dry_run: bool = False,
+        total_shards: int = 128,
         *args,
         **kwargs,
     ):
@@ -54,6 +59,11 @@ class PostgreSQLHandler:
         self.logger = JinaLogger('psq_handler')
         self.table = table
         self.dump_dtype = dump_dtype
+        self.total_shards = total_shards
+        # TODO maybe calculate this based on existing data.
+        #  Otherwise data will not be distributed evenly
+        # not a big deal though
+        self._next_shard = 0
 
         if not dry_run:
             self.postgreSQL_pool = psycopg2.pool.SimpleConnectionPool(
@@ -116,7 +126,9 @@ class PostgreSQLHandler:
             f'''CREATE TABLE IF NOT EXISTS {self.table} (
                 doc_id VARCHAR PRIMARY KEY,
                 embedding BYTEA,
-                doc BYTEA
+                doc BYTEA,
+                shard int,
+                last_updated timestamp
             );
             INSERT INTO {SCHEMA_VERSIONS_TABLE_NAME} VALUES (%s, %s);''',
             (self.table, SCHEMA_VERSION),
@@ -124,27 +136,39 @@ class PostgreSQLHandler:
 
     def _table_exists(self):
         return self._execute_sql_gracefully(
-            'SELECT EXISTS(SELECT * FROM information_schema.tables WHERE table_name=%s)',
+            'SELECT EXISTS'
+            '('
+            'SELECT * FROM information_schema.tables '
+            'WHERE table_name=%s'
+            ')',
             (self.table,),
         ).fetchall()[0][0]
 
     def _assert_table_schema_version(self):
         cursor = self.connection.cursor()
         cursor.execute(
-            f'SELECT schema_version FROM {SCHEMA_VERSIONS_TABLE_NAME} WHERE table_name=%s;',
+            f'SELECT schema_version FROM '
+            f'{SCHEMA_VERSIONS_TABLE_NAME} '
+            f'WHERE table_name=%s;',
             (self.table,),
         )
         result = cursor.fetchone()
         if result:
             if result[0] != SCHEMA_VERSION:
                 raise RuntimeError(
-                    f'The schema versions of the database (version {result[0]}) and the Executor (version {SCHEMA_VERSION}) do not match. \
-Please migrate your data to the latest version or use an Executor version with a matching schema version.'
+                    f'The schema versions of the database '
+                    f'(version {result[0]}) and the Executor '
+                    f'(version {SCHEMA_VERSION}) do not match. '
+                    f'Please migrate your data to the latest '
+                    f'version or use an Executor version with a '
+                    f'matching schema version.'
                 )
         else:
             raise RuntimeError(
-                f'The schema versions of the database (NO version number) and the Executor (version {SCHEMA_VERSION}) do not match. \
-Please migrate your data to the latest version.'
+                f'The schema versions of the database '
+                f'(NO version number) and the Executor '
+                f'(version {SCHEMA_VERSION}) do not match.'
+                f'Please migrate your data to the latest version.'
             )
 
     def add(self, docs: DocumentArray, *args, **kwargs):
@@ -161,19 +185,26 @@ Please migrate your data to the latest version.'
         try:
             psycopg2.extras.execute_batch(
                 cursor,
-                f'INSERT INTO {self.table} (doc_id, embedding, doc) VALUES (%s, %s, %s)',
+                f'INSERT INTO {self.table} '
+                f'(doc_id, embedding, doc, shard, last_updated) '
+                f'VALUES (%s, %s, %s, %s, %s)',
                 [
                     (
                         doc.id,
-                        doc.embedding.astype(self.dump_dtype).tobytes() if doc.embedding is not None else None,
+                        doc.embedding.astype(self.dump_dtype).tobytes()
+                        if doc.embedding is not None
+                        else None,
                         doc_without_embedding(doc),
+                        self._get_next_shard(),
+                        self._get_timestamp(),
                     )
                     for doc in docs
                 ],
             )
         except psycopg2.errors.UniqueViolation as e:
             self.logger.warning(
-                f'Document already exists in PSQL database. {e}. Skipping entire transaction...'
+                f'Document already exists in PSQL database.'
+                f' {e}. Skipping entire transaction...'
             )
             self.connection.rollback()
         self.connection.commit()
@@ -189,11 +220,16 @@ Please migrate your data to the latest version.'
         cursor = self.connection.cursor()
         psycopg2.extras.execute_batch(
             cursor,
-            f'UPDATE {self.table} SET embedding = %s, doc = %s WHERE doc_id = %s',
+            f'UPDATE {self.table}\
+             SET embedding = %s,\
+             doc = %s,\
+             last_updated = %s \
+            WHERE doc_id = %s',
             [
                 (
                     doc.embedding.astype(self.dump_dtype).tobytes(),
                     doc_without_embedding(doc),
+                    self._get_timestamp(),
                     doc.id,
                 )
                 for doc in docs
@@ -222,7 +258,8 @@ Please migrate your data to the latest version.'
         self.postgreSQL_pool.closeall()
 
     def search(self, docs: DocumentArray, return_embeddings: bool = True, **kwargs):
-        """Use the Postgres db as a key-value engine, returning the metadata of a document id"""
+        """Use the Postgres db as a key-value engine,
+        returning the metadata of a document id"""
         if return_embeddings:
             embeddings_field = ', embedding '
         else:
@@ -260,11 +297,61 @@ Please migrate your data to the latest version.'
         records = cursor.fetchall()
         return records[0][0]
 
+    def _get_next_shard(self):
+        next_shard = self._next_shard
+        self._next_shard += 1
+        if self._next_shard == self.total_shards:
+            self._next_shard = 0
+        return next_shard
+
+    def _get_timestamp(self):
+        # TODO is this timezone aware?
+        return datetime.datetime.now()
+
+    def snapshot(self):
+        """
+        Saves the state of the data table in a new table
+        """
+        # TODO move to separate PSQL instance to not affect performance?
+        snapshot_name = 'snapshot'
+        try:
+            cursor = self.connection.cursor()
+            # TODO move to using a separate database / replica
+            cursor.execute(f'drop table if exists {snapshot_name}')
+            cursor.execute(
+                f'create table {snapshot_name} as (select * from {self.table});'
+            )
+            self.connection.commit()
+            self.logger.info('Successfully created snapshot')
+        except (Exception, psycopg2.Error) as error:
+            self.logger.error(f'Error snapshotting: {error}')
+            self.connection.rollback()
+        self.connection.commit()
+
+    def get_snapshot(self, shards_to_get: List[int]):
+        """
+        Get the data from the snapshot, for a specific range of virtual shards
+        """
+        snapshot_name = 'snapshot'
+        shards_to_get = [str(shard) for shard in shards_to_get]
+        try:
+            cursor = self.connection.cursor('snapshot')
+            cursor.itersize = 10000
+            cursor.execute(
+                f'SELECT doc_id, embedding from {snapshot_name} '
+                f'WHERE shard in ({",".join(shards_to_get)}) ORDER BY doc_id'
+            )
+            for rec in cursor:
+                yield rec[0], rec[1]
+        except (Exception, psycopg2.Error) as error:
+            self.logger.error(f'Error importing snapshot: {error}')
+            self.connection.rollback()
+        self.connection.commit()
+
     def get_generator(
         self, include_metas=True
     ) -> Generator[Tuple[str, bytes, Optional[bytes]], None, None]:
         connection = self._get_connection()
-        # always order the dump by id as integer
         cursor = connection.cursor('generator')  # server-side cursor
         cursor.itersize = 10000
         if include_metas:
@@ -272,11 +359,15 @@ Please migrate your data to the latest version.'
                 f'SELECT doc_id, embedding, doc FROM {self.table} ORDER BY doc_id'
             )
             for rec in cursor:
-                yield rec[0], np.frombuffer(rec[1]) if rec[1] is not None else None, rec[2]
+                yield rec[0], np.frombuffer(rec[1]) if rec[
+                    1
+                ] is not None else None, rec[2]
         else:
             cursor.execute(
                 f'SELECT doc_id, embedding FROM {self.table} ORDER BY doc_id'
             )
             for rec in cursor:
-                yield rec[0], np.frombuffer(rec[1]) if rec[1] is not None else None, None
+                yield rec[0], np.frombuffer(rec[1]) if rec[
+                    1
+                ] is not None else None, None
         self._close_connection(connection)

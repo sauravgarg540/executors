@@ -3,10 +3,10 @@ __license__ = "Apache-2.0"
 
 from typing import Dict, List
 
-from jina import Executor, requests, DocumentArray, Document
-
+from jina import Document, DocumentArray, Executor, requests
 from jina_commons import get_logger
 from jina_commons.indexers.dump import export_dump_streaming
+
 from .postgreshandler import PostgreSQLHandler
 
 
@@ -29,6 +29,8 @@ class PostgreSQLStorage(Executor):
     :param table: the table name to use
     :param default_return_embeddings: whether to return embeddings on search or not
     :param dry_run: If True, no database connection will be build.
+    :param total_shards: the number of shards to distribute
+     the data (used when rolling update on Searcher side)
     :param args: other arguments
     :param kwargs: other keyword arguments
     """
@@ -45,6 +47,7 @@ class PostgreSQLStorage(Executor):
         default_traversal_paths: List[str] = ['r'],
         default_return_embeddings: bool = True,
         dry_run: bool = False,
+        total_shards: int = 128,
         *args,
         **kwargs,
     ):
@@ -57,6 +60,7 @@ class PostgreSQLStorage(Executor):
         self.database = database
         self.table = table
         self.logger = get_logger(self)
+        self.total_shards = total_shards
         self.handler = PostgreSQLHandler(
             hostname=self.hostname,
             port=self.port,
@@ -66,6 +70,7 @@ class PostgreSQLStorage(Executor):
             table=self.table,
             max_connections=max_connections,
             dry_run=dry_run,
+            total_shards=total_shards,
         )
         self.default_return_embeddings = default_return_embeddings
 
@@ -155,13 +160,15 @@ class PostgreSQLStorage(Executor):
         """
         Close the connections in the connection pool
         """
+        # TODO perhaps store next_shard_to_use?
         self.handler.close()
 
     @requests(on='/search')
     def search(self, docs: DocumentArray, parameters: Dict, **kwargs):
         """Get the Documents by the ids of the docs in the DocArray
 
-        :param docs: the DocumentArray to search with (they only need to have the `.id` set)
+        :param docs: the DocumentArray to search
+         with (they only need to have the `.id` set)
         :param parameters: the parameters to this request
         """
         if docs is None:
@@ -177,3 +184,36 @@ class PostgreSQLStorage(Executor):
                     'return_embeddings', self.default_return_embeddings
                 ),
             )
+
+    @requests(on='/snapshot')
+    def snapshot(self, **kwargs):
+        # TODO argument with table name, database location
+        # create a duplicate of the table
+        # or send to another PSQL instance to avoid perf hit?
+        with self.handler as postgres_handler:
+            postgres_handler.snapshot()
+
+    def get_snapshot(self, shard_id: int, total_shards: int):
+        shards_to_get = self._vshards_to_get(shard_id, total_shards)
+
+        with self.handler as postgres_handler:
+            return postgres_handler.get_snapshot(shards_to_get)
+
+    def _vshards_to_get(self, shard_id, total_shards):
+        if shard_id > total_shards - 1:
+            raise ValueError('shard_id is 0-indexed out of range(total_shards)')
+        vshards = list(range(self.total_shards))
+        vshard_part = (
+            self.total_shards // total_shards
+        )  # nr of virtual shards given to one shard
+        vshard_remainder = vshard_part % total_shards
+        if shard_id == total_shards - 1:
+            shards_to_get = vshards[
+                shard_id
+                * vshard_part : ((shard_id + 1) * vshard_part + vshard_remainder)
+            ]
+        else:
+            shards_to_get = vshards[
+                shard_id * vshard_part : (shard_id + 1) * vshard_part
+            ]
+        return shards_to_get

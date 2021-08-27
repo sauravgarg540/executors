@@ -2,10 +2,10 @@ __copyright__ = "Copyright (c) 2021 Jina AI Limited. All rights reserved."
 __license__ = "Apache-2.0"
 
 import gzip
-from typing import Iterable, Optional, Dict, List
+from typing import Callable, Dict, Iterable, List, Optional
 
 import numpy as np
-from jina import Executor, DocumentArray, requests, Document
+from jina import Document, DocumentArray, Executor, requests
 from jina.helper import batch_iterator
 from jina_commons import get_logger
 from jina_commons.indexers.dump import import_vectors
@@ -14,27 +14,39 @@ from jina_commons.indexers.dump import import_vectors
 class FaissSearcher(Executor):
     """Faiss-powered vector indexer
 
-    For more information about the Faiss supported parameters and installation problems, please consult:
+    For more information about the Faiss
+    supported parameters and installation problems, please consult:
         - https://github.com/facebookresearch/faiss
 
     .. note::
         Faiss package dependency is only required at the query time.
 
-    :param index_key: index type supported by ``faiss.index_factory``
-    :param train_filepath: the training data file path, e.g ``faiss.tgz`` or `faiss.npy`. The data file is expected
-        to be either `.npy` file from `numpy.save()` or a `.tgz` file from `NumpyIndexer`. If none is provided, `indexed` data will be used
-        to train the Indexer (In that case, one must be careful when sharding is enabled, because every shard will be trained with its own part of data).
+    :param index_key: index type supported
+        by ``faiss.index_factory``
+    :param train_filepath: the training data file path,
+        e.g ``faiss.tgz`` or `faiss.npy`. The data file is expected
+        to be either `.npy` file from `numpy.save()` or a `.tgz` file
+        from `NumpyIndexer`. If none is provided, `indexed` data will be used
+        to train the Indexer (In that case, one must be careful when sharding
+        is enabled, because every shard will be trained with its own part of data).
         The data will only be loaded if `requires_training` is set to True.
-    :param max_num_training_points: Optional argument to consider only a subset of training points to training data from `train_filepath`.
+    :param max_num_training_points: Optional argument to consider only a subset of
+    training points to training data from `train_filepath`.
         The points will be selected randomly from the available points
     :param prefetch_size: the number of data to pre-load into RAM
-    :param requires_training: Boolean flag indicating if the index type requires training to be run before building index.
-    :param metric: 'l2' or 'inner_product' accepted. Determines which distances to optimize by FAISS. l2...smaller is better, inner_product...larger is better
-    :param normalize: whether or not to normalize the vectors e.g. for the cosine similarity https://github.com/facebookresearch/faiss/wiki/MetricType-and-distances#how-can-i-index-vectors-for-cosine-similarity
+    :param requires_training: Boolean flag indicating if the index type
+        requires training to be run before building index.
+    :param metric: 'l2' or 'inner_product' accepted. Determines which distances to
+        optimize by FAISS. l2...smaller is better, inner_product...larger is better
+    :param normalize: whether or not to normalize the vectors e.g. for the cosine
+        similarity
+        https://github.com/facebookresearch/faiss/wiki/MetricType-and-distances#how-can-i-index-vectors-for-cosine-similarity
     :param nprobe: Number of clusters to consider at search time.
-    :param is_distance: Boolean flag that describes if distance metric need to be reinterpreted as similarities.
-    :param make_direct_map: Boolean flag that describes if direct map has to be computed after building the index. Useful if you need to call `fill_embedding` endpoint and reconstruct vectors
-        by id
+    :param is_distance: Boolean flag that describes if distance metric need to be
+        reinterpreted as similarities.
+    :param make_direct_map: Boolean flag that describes if direct map has to be
+        computed after building the index. Useful if you need to call `fill_embedding`
+        endpoint and reconstruct vectors by id
 
     .. highlight:: python
     .. code-block:: python
@@ -65,6 +77,7 @@ class FaissSearcher(Executor):
         normalize: bool = False,
         nprobe: int = 1,
         dump_path: Optional[str] = None,
+        dump_func: Optional[Callable] = None,
         prefetch_size: Optional[int] = 10,
         default_traversal_paths: List[str] = ['r'],
         is_distance: bool = False,
@@ -90,40 +103,62 @@ class FaissSearcher(Executor):
         self._doc_id_to_offset = {}
 
         self.logger = get_logger(self)
+        self._load_dump(dump_path, dump_func, prefetch_size, **kwargs)
 
-        dump_path = dump_path or kwargs.get('runtime_args').get('dump_path')
+    def _load_dump(self, dump_path, dump_func, prefetch_size, **kwargs):
+        dump_path = dump_path or kwargs.get('runtime_args', {}).get('dump_path')
+
+        iterator = None
+
         if dump_path is not None:
             self.logger.info('Start building "FaissIndexer" from dump data')
             ids_iter, vecs_iter = import_vectors(
                 dump_path, str(self.runtime_args.pea_id)
             )
-            self._ids = np.array(list(ids_iter))
-            self._doc_id_to_offset = {v: i for i, v in enumerate(self._ids)}
+            iterator = zip(ids_iter, vecs_iter)
+        elif dump_func is not None:
+            iterator = dump_func(shard_id=self.runtime_args.pea_id)
+        else:
+            self.logger.warning(
+                'No "dump_data" or "dump_func" passed to "FaissIndexer".'
+                ' Use .rolling_update() to re-initialize it...'
+            )
+            return
 
+        if iterator is not None:
+            iterator = self._iterate_vectors_and_save_ids(iterator)
             self._prefetch_data = []
             if self.prefetch_size and self.prefetch_size > 0:
                 for _ in range(prefetch_size):
                     try:
-                        self._prefetch_data.append(next(vecs_iter))
+                        self._prefetch_data.append(next(iterator))
                     except StopIteration:
                         break
             else:
-                self._prefetch_data = list(vecs_iter)
+                self._prefetch_data = list(iterator)
 
             self.num_dim = self._prefetch_data[0].shape[0]
             self.dtype = self._prefetch_data[0].dtype
-            self.index = self._build_index(vecs_iter)
-        else:
-            self.logger.warning(
-                'No data loaded in "FaissIndexer". Use .rolling_update() to re-initialize it...'
-            )
+            self.index = self._build_index(iterator)
+
+    def _iterate_vectors_and_save_ids(self, iterator):
+        self._ids = []
+        self._doc_id_to_offset = {}
+        for position, id_vector in enumerate(iterator):
+            id_ = id_vector[0]
+            vector = id_vector[1]
+            self._ids.append(id_)
+            self._doc_id_to_offset[id_] = position
+            yield np.frombuffer(vector)
 
     def device(self):
         """
-        Set the device on which the executors using :mod:`faiss` library will be running.
+        Set the device on which the executors using :mod:`faiss` library
+         will be running.
 
         ..notes:
-            In the case of using GPUs, we only use the first gpu from the visible gpus. To specify which gpu to use,
+            In the case of using GPUs, we only use the first gpu from the
+            visible gpus. To specify which gpu to use,
             please use the environment variable `CUDA_VISIBLE_DEVICES`.
         """
         import faiss
@@ -166,7 +201,8 @@ class FaissSearcher(Executor):
             metric = faiss.METRIC_INNER_PRODUCT
         if self.metric not in {'inner_product', 'l2'}:
             self.logger.warning(
-                'Invalid distance metric for Faiss index construction. Defaulting to l2 distance'
+                'Invalid distance metric for Faiss'
+                ' index construction. Defaulting to l2 distance'
             )
 
         index = self.to_device(
@@ -178,20 +214,21 @@ class FaissSearcher(Executor):
                 train_data = self._load_training_data(self.train_filepath)
 
             else:
-                self.logger.info(f'Taking indexed data as training points')
+                self.logger.info('Taking indexed data as training points')
                 while (
                     self.max_num_training_points
                     and len(self._prefetch_data) < self.max_num_training_points
                 ):
                     try:
                         self._prefetch_data.append(next(vecs_iter))
-                    except:
+                    except Exception as _:  # noqa: F841
                         break
                 train_data = np.stack(self._prefetch_data)
 
             if train_data is None:
                 self.logger.warning(
-                    'Loading training data failed. some faiss indexes require previous training.'
+                    'Loading training data failed. '
+                    'some faiss indexes require previous training.'
                 )
             else:
                 if (
@@ -244,7 +281,8 @@ class FaissSearcher(Executor):
     def search(
         self, docs: DocumentArray, parameters: Optional[Dict] = None, *args, **kwargs
     ):
-        """Find the top-k vectors with smallest ``metric`` and return their ids in ascending order.
+        """Find the top-k vectors with smallest
+        ``metric`` and return their ids in ascending order.
 
         :param docs: the DocumentArray containing the documents to search with
         :param parameters: the parameters for the request
@@ -294,7 +332,8 @@ class FaissSearcher(Executor):
             self.num_dim = _num_dim
         if self.num_dim != _num_dim:
             raise ValueError(
-                'training data should have the same number of features as the index, {} != {}'.format(
+                'training data should have the same '
+                'number of features as the index, {} != {}'.format(
                     self.num_dim, _num_dim
                 )
             )
@@ -321,7 +360,8 @@ class FaissSearcher(Executor):
                 result = np.load(train_filepath)
                 if isinstance(result, np.lib.npyio.NpzFile):
                     self.logger.warning(
-                        '.npz format is not supported. Please save the array in .npy format.'
+                        '.npz format is not supported. '
+                        'Please save the array in .npy format.'
                     )
                     result = None
             except Exception as e:
@@ -338,9 +378,8 @@ class FaissSearcher(Executor):
                     result = f.read()
             except Exception as e:
                 self.logger.error(
-                    'Loading training data from binary file failed, filepath={}, {}'.format(
-                        train_filepath, e
-                    )
+                    'Loading training data from binary'
+                    ' file failed, filepath={}, {}'.format(train_filepath, e)
                 )
         return result
 
@@ -353,7 +392,8 @@ class FaissSearcher(Executor):
                 )
         except EOFError:
             self.logger.error(
-                f'{abspath} is broken/incomplete, perhaps forgot to ".close()" in the last usage?'
+                f'{abspath} is broken/incomplete, '
+                f'perhaps forgot to ".close()" in the last usage?'
             )
 
     @requests(on='/fill_embedding')
@@ -363,13 +403,19 @@ class FaissSearcher(Executor):
         for doc in docs:
             if doc.id in self._doc_id_to_offset:
                 try:
-                    reconstruct_embedding = self.index.reconstruct(self._doc_id_to_offset[doc.id])
-                    doc.embedding = np.array(
-                        reconstruct_embedding
+                    reconstruct_embedding = self.index.reconstruct(
+                        self._doc_id_to_offset[doc.id]
                     )
+                    doc.embedding = np.array(reconstruct_embedding)
                 except RuntimeError as exception:
-                    self.logger.warning(f'Trying to reconstruct from document id failed. Most likely the index built '
-                                        f'from index key {self.index_key} does not support this operation. {repr(exception)}')
+                    self.logger.warning(
+                        f'Trying to reconstruct from '
+                        f'document id failed. Most '
+                        f'likely the index built '
+                        f'from index key {self.index_key} \
+                         does not support this '
+                        f'operation. {repr(exception)}'
+                    )
             else:
                 self.logger.debug(f'Document {doc.id} not found in index')
 

@@ -1,3 +1,4 @@
+import datetime
 import os
 import time
 from pathlib import Path
@@ -6,7 +7,7 @@ import numpy as np
 import pytest
 from jina import Document, DocumentArray, Executor, Flow
 from jina.logging.profile import TimeContext
-from jina_commons.indexers.dump import import_vectors, import_metas
+from jina_commons.indexers.dump import import_metas, import_vectors
 
 from ..postgres_indexer import PostgreSQLStorage
 from ..postgreshandler import doc_without_embedding
@@ -179,3 +180,87 @@ def test_return_embeddings(docker_compose):
     query2 = DocumentArray([Document(id=doc.id)])
     indexer.search(query2, parameters={"return_embeddings": False})
     assert query2[0].embedding is None
+
+
+@pytest.mark.parametrize('docker_compose', [compose_yml], indirect=['docker_compose'])
+def test_snapshot(docker_compose):
+
+    postgres_indexer = PostgreSQLStorage()
+    # TODO test cycle of vshard allocation
+    NR_DOCS = postgres_indexer.total_shards * 2 + 5
+    original_docs = DocumentArray(
+        list(get_documents(nr=NR_DOCS, chunks=0, same_content=False))
+    )
+
+    NR_NEW_DOCS = 30
+    new_docs = DocumentArray(
+        list(
+            get_documents(
+                nr=NR_NEW_DOCS, index_start=NR_DOCS, chunks=0, same_content=False
+            )
+        )
+    )
+
+    # make sure to cleanup if the PSQL instance is kept running
+    postgres_indexer.delete(original_docs, {})
+    postgres_indexer.delete(new_docs, {})
+
+    # indexing the documents
+    postgres_indexer.add(original_docs, {})
+    np.testing.assert_equal(postgres_indexer.size, NR_DOCS)
+
+    # create a snapshot
+    postgres_indexer.snapshot()
+
+    # data added the snapshot will not be part of the export
+    postgres_indexer.add(new_docs, {})
+
+    np.testing.assert_equal(postgres_indexer.size, NR_DOCS + NR_NEW_DOCS)
+
+    # get the data in the snapshot for shard 0, out of a set of 3 shards
+    data = postgres_indexer.get_snapshot(shard_id=0, total_shards=3)
+
+    def _nr_docs_expected(full_nr_docs):
+        return (
+            postgres_indexer.total_shards
+            // 3
+            * (full_nr_docs // postgres_indexer.total_shards)
+            + full_nr_docs % postgres_indexer.total_shards
+        )
+
+    # this happens when total_shards % nr_docs != 0
+    docs_expected = _nr_docs_expected(NR_DOCS)
+    np.testing.assert_equal(len(list(data)), docs_expected)
+
+    # create another snapshot
+    postgres_indexer.snapshot()
+    timestamp = datetime.datetime.now()
+
+    # docs for the delta resolving
+    NR_DOCS_DELTA = 33
+    docs_delta = DocumentArray(
+        list(
+            get_documents(
+                nr=NR_DOCS_DELTA, index_start=NR_DOCS, chunks=0, same_content=False
+            )
+        )
+    )
+    postgres_indexer.add(docs_delta, {})
+
+    # TODO also add some updates and some deletions for delta
+
+    # get the data in the snapshot for shard 0, out of a set of 3 shards
+    data = postgres_indexer.get_snapshot(shard_id=0, total_shards=3)
+    data = list(data)
+
+    docs_expected = _nr_docs_expected(NR_DOCS + NR_NEW_DOCS)
+    np.testing.assert_equal(len(data), docs_expected)
+
+    deltas = postgres_indexer.get_delta(shard_id=0, total_shards=3, timestamp=timestamp)
+    # deltas will be like?
+    # DOC_ID, OPERATION, DATA
+    deltas = list(deltas)
+    np.testing.assert_equal(len(deltas), docs_expected + NR_DOCS_DELTA)
+
+    # move to commons
+    data_resolved = postgres_indexer.resolve_snapshot_delta(data, deltas)
